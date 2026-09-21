@@ -33,22 +33,31 @@ This document specifies the design and architecture for an AI-native backend ser
 6.  **Retrieval:** Client polls the job status and downloads the video when `COMPLETED`.
 
 ### 4.2. AI Pipeline Steps
-To ensure reliability against non-determinism, the generation is broken into deterministic steps with validation:
+To ensure reliability against non-determinism, the generation is broken into discrete steps with validation gates between each:
 
-*   **Step 0: Validation (`validate_prompt`)**
-    *   Uses an LLM or keyword rules to check if the prompt is chemistry-related and within the supported scope.
-    *   *Failure State:* If rejected, the job immediately fails with reason "Prompt is not related to supported chemistry topics."
+*   **Step 0: Prompt Validation (`validate_prompt`)**
+    *   Verifies the prompt is chemistry-related and within the three supported topics.
+    *   *Failure State:* Job is immediately marked `FAILED` with reason: `"Prompt is not related to supported chemistry topics."` No AI calls are wasted.
+
 *   **Step 1: Script Generation (`gen_scripts`)**
-    *   LLM generates a structured JSON response containing the voiceover script broken into scenes, and visual directions for each scene.
+    *   LLM generates a structured JSON payload: per-scene voiceover text + visual directions (which formulas to show, what to animate).
+    *   *Guardrail:* JSON schema is validated after each attempt; retried up to 2 times on parse failure.
+
 *   **Step 2: Voiceover Generation (`gen_speech`)**
-    *   Pass the script to a TTS engine to generate `.wav` or `.mp3` files. Calculate audio duration for syncing Manim animations.
+    *   TTS engine converts each scene's narration text into a `.mp3` file.
+    *   Audio duration per scene is measured and passed to Step 3 for animation timing.
+    *   *Guardrail:* File-size and duration checks reject silent/empty audio before proceeding.
+
 *   **Step 3: Manim Code Generation (`gen_code`)**
-    *   LLM generates Manim Python code based on the script, visual directions, and audio timings.
-    *   *Guardrail:* Provide the LLM with a strict Manim template and examples of correct syntax.
-*   **Step 4: Code Validation & Rendering (The "Retry Loop")**
-    *   Execute the Manim code in an isolated subprocess.
-    *   *Guardrail:* If the Manim subprocess crashes (e.g., syntax error, invalid method), capture the `stderr`, feed it back to the LLM to fix the code (`gen_code_fix`), and retry (max 3 retries).
-    *   *Failure State:* If it fails after max retries, mark the job as `FAILED` (Generation Error).
+    *   LLM generates a Python Manim scene using the script, visual directions, and audio timings.
+    *   All visuals (chemical formulas, molecular diagrams, pH scale, bond diagrams) are expressed as Manim/LaTeX primitives — **no external images needed**.
+    *   *Guardrail:* LLM is given a strict Manim template and few-shot examples of correct chemistry scenes.
+
+*   **Step 4: Render + Auto-fix Retry Loop**
+    *   Manim code is executed in an isolated `subprocess` with a configurable timeout.
+    *   *Guardrail:* If the subprocess crashes (syntax error, undefined method), `stderr` is fed back to the LLM to generate a corrected version. Retried up to **3 times**.
+    *   *Failure State:* If all retries are exhausted, job is marked `FAILED` with `"Render failed after 3 retries: <last error>"`.
+
 
 ## 5. API Flow and Design
 
