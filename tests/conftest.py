@@ -33,11 +33,11 @@ def store() -> JobStore:
 def service(store: JobStore) -> JobService:
     """A JobService wired to the isolated store, with a no-op pipeline stub."""
 
-    def _stub_pipeline(job, store_):
+    async def _stub_pipeline(job_id, prompt, store_):
         # Intentionally does nothing — tests control state transitions manually.
         pass
 
-    return JobService(store=store, pipeline=_stub_pipeline)
+    return JobService(store=store, pipeline_runner=_stub_pipeline)
 
 
 @pytest.fixture

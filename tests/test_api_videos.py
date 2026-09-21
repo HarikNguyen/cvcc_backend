@@ -135,7 +135,7 @@ class TestGetJobStatus:
         job_id = self._submit(client)
         job = service.get_job(job_id)
         job.mark_processing("Generating voiceover...")
-        service._store.save(job)
+        service.store.save(job)
 
         data = client.get(f"{self.LIST_ENDPOINT}/{job_id}").json()
         assert data["status"] == "PROCESSING"
@@ -145,7 +145,7 @@ class TestGetJobStatus:
         job_id = self._submit(client)
         job = service.get_job(job_id)
         job.mark_failed("Prompt is not chemistry-related.")
-        service._store.save(job)
+        service.store.save(job)
 
         data = client.get(f"{self.LIST_ENDPOINT}/{job_id}").json()
         assert data["status"] == "FAILED"
@@ -174,7 +174,7 @@ class TestGetArtifact:
         job_id = self._submit(client)
         job = service.get_job(job_id)
         job.mark_processing()
-        service._store.save(job)
+        service.store.save(job)
         resp = client.get(f"{self.LIST_ENDPOINT}/{job_id}/artifact")
         assert resp.status_code == 400
 
@@ -182,7 +182,7 @@ class TestGetArtifact:
         job_id = self._submit(client)
         job = service.get_job(job_id)
         job.mark_failed("Render failed.")
-        service._store.save(job)
+        service.store.save(job)
         resp = client.get(f"{self.LIST_ENDPOINT}/{job_id}/artifact")
         assert resp.status_code == 400
 
@@ -195,7 +195,7 @@ class TestGetArtifact:
         job = service.get_job(job_id)
         job.mark_processing()
         job.mark_completed("/nonexistent/path/video.mp4")
-        service._store.save(job)
+        service.store.save(job)
         resp = client.get(f"{self.LIST_ENDPOINT}/{job_id}/artifact")
         assert resp.status_code == 404
 
@@ -210,7 +210,7 @@ class TestGetArtifact:
             job = service.get_job(job_id)
             job.mark_processing()
             job.mark_completed(tmp_path)
-            service._store.save(job)
+            service.store.save(job)
 
             resp = client.get(f"{self.LIST_ENDPOINT}/{job_id}/artifact")
             assert resp.status_code == 200

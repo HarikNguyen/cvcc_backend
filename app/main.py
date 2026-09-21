@@ -5,6 +5,9 @@ FastAPI application factory.
 """
 
 from fastapi import FastAPI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.api.v1.videos import router as videos_router
 

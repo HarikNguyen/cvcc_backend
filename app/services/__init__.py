@@ -1,104 +1,106 @@
 """
-app/services/job_service.py
-----------------------------
-Business-logic layer that sits between the router and the AI pipeline.
-
-Responsibilities:
-  - Create and persist Job objects.
-  - Dispatch background generation tasks.
-  - Expose query helpers for the router.
-
-The actual AI pipeline (validate_prompt, gen_scripts, gen_code, etc.)
-is injected via the `pipeline` callable so it can be swapped for a
-stub/mock in tests without touching this service.
+app/services/__init__.py
+-------------------------
+Business logic layer coordinating the background video generation pipeline.
+Injects the real AI pipeline components (Groq, TTS, Manim).
 """
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import asyncio
+import logging
+from typing import Callable, Coroutine
 
-from app.core.store import JobStore, job_store as _default_store
+from app.core.store import JobStore, job_store
 from app.models.job import Job, JobStatus
+from app.pipeline.gen_scripts import generate_script
+from app.pipeline.gen_speech import generate_speech
+from app.pipeline.gen_code import generate_video
+
+logger = logging.getLogger(__name__)
+
+# Type alias for the pipeline runner function injected into JobService
+PipelineCallable = Callable[[str, str, JobStore], Coroutine[None, None, None]]
 
 
-# Type alias for the generation callable accepted by the service.
-# Signature: pipeline(job: Job, store: JobStore) -> None
-PipelineCallable = Callable[[Job, JobStore], None]
-
-
-def _noop_pipeline(job: Job, store: JobStore) -> None:
+async def real_pipeline(job_id: str, prompt: str, store: JobStore) -> None:
     """
-    Placeholder pipeline used when the AI pipeline is not yet wired.
-    Keeps the job in PROCESSING state indefinitely — fine for API-only tests.
-    In production this is replaced by the real pipeline from app.services.pipeline.
+    The actual AI pipeline executor.
+    Runs asynchronously in the background. Coordinates:
+      1. Script generation (Groq)
+      2. Speech synthesis (Google Cloud TTS)
+      3. Video rendering + Audio muxing (Manim + FFmpeg)
     """
-    pass  # pragma: no cover
+    job = store.get(job_id)
+    if not job:
+        logger.error(f"Pipeline started for unknown job {job_id}")
+        return
+
+    # Helper to update progress and save
+    def _update_progress(msg: str):
+        job.advance_progress(msg)
+        store.save(job)
+        logger.info(f"Job {job_id}: {msg}")
+
+    try:
+        # Mark as processing
+        job.mark_processing()
+        store.save(job)
+        logger.info(f"Job {job_id} started processing.")
+
+        # ── Step 1: Generate Script ───────────────────────────────────────
+        _update_progress("Generating video script (Groq)...")
+        # Run synchronous generate_script in a threadpool to not block the event loop
+        script = await asyncio.to_thread(generate_script, prompt, _update_progress)
+
+        # ── Step 2: Generate Speech ───────────────────────────────────────
+        _update_progress("Generating voiceover (Google Cloud TTS)...")
+        speech = await asyncio.to_thread(generate_speech, script, job_id, None, _update_progress)
+
+        # ── Step 3: Render Video ──────────────────────────────────────────
+        _update_progress("Rendering video (Manim)...")
+        final_video_path = await asyncio.to_thread(generate_video, script, speech, job_id, None, None, _update_progress)
+
+        # ── Success ───────────────────────────────────────────────────────
+        job.mark_completed(final_video_path)
+        store.save(job)
+        logger.info(f"Job {job_id} COMPLETED successfully.")
+
+    except Exception as e:
+        logger.exception(f"Job {job_id} FAILED during pipeline execution.")
+        job.mark_failed(f"{type(e).__name__}: {str(e)}")
+        store.save(job)
 
 
 class JobService:
     """
-    Orchestrates job lifecycle.
-
-    Parameters
-    ----------
-    store:    The JobStore adapter to use (defaults to the global singleton).
-    pipeline: Callable that drives the full generation pipeline. Injected
-              so tests can pass a stub without spawning real AI calls.
+    Manages job lifecycle and handles API requests.
     """
+    def __init__(self, store: JobStore, pipeline_runner: PipelineCallable):
+        self.store = store
+        self._pipeline_runner = pipeline_runner
 
-    def __init__(
-        self,
-        store: JobStore = _default_store,
-        pipeline: PipelineCallable = _noop_pipeline,
-    ) -> None:
-        self._store = store
-        self._pipeline = pipeline
-
-    # ── Commands ───────────────────────────────────────────────────────────
-
-    def submit(self, prompt: str, background_tasks=None) -> Job:
-        """
-        Create a new job, persist it, and enqueue the generation pipeline.
-
-        Parameters
-        ----------
-        prompt:           The learner's chemistry question.
-        background_tasks: FastAPI BackgroundTasks instance. When None (e.g.,
-                          in unit tests) the pipeline is NOT dispatched, which
-                          lets callers verify job creation independently.
-
-        Returns
-        -------
-        The newly created Job (status == WAITING).
-        """
+    def submit(self, prompt: str, background_tasks) -> Job:
         job = Job(prompt=prompt)
-        self._store.save(job)
+        self.store.save(job)
 
-        if background_tasks is not None:
-            background_tasks.add_task(self._pipeline, job, self._store)
-
+        # Offload the heavy pipeline to FastAPI's background task queue
+        background_tasks.add_task(self._pipeline_runner, job.id, prompt, self.store)
         return job
 
-    # ── Queries ────────────────────────────────────────────────────────────
+    def get_job(self, job_id: str) -> Job | None:
+        return self.store.get(job_id)
 
-    def get_job(self, job_id: str) -> Optional[Job]:
-        """Return a single Job by ID, or None."""
-        return self._store.get(job_id)
+    def list_jobs(self) -> list[Job]:
+        return self.store.list_all()
 
-    def list_jobs(self) -> List[Job]:
-        """Return all jobs ordered by creation date descending."""
-        return self._store.list_all()
-
-    def get_video_path(self, job_id: str) -> Optional[str]:
-        """
-        Return the filesystem path to the video artifact, or None if not
-        available (job not found, not completed, or path missing).
-        """
-        job = self._store.get(job_id)
-        if job is None or job.status != JobStatus.COMPLETED:
+    def get_video_path(self, job_id: str) -> str | None:
+        job = self.store.get(job_id)
+        if not job or job.status != JobStatus.COMPLETED:
             return None
         return job.video_path
 
 
-# Module-level default instance — routers import this directly.
-job_service = JobService()
+# Singleton instance used by the FastAPI router.
+# Using real_pipeline instead of _noop_pipeline now.
+job_service = JobService(job_store, real_pipeline)

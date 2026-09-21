@@ -29,7 +29,7 @@ from app.pipeline.gen_scripts.prompts import build_system_prompt, build_user_pro
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 _TEMPERATURE = 0.3
 _MAX_TOKENS = 3000
 _MAX_RETRIES = 3
