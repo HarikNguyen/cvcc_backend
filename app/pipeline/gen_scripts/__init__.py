@@ -1,10 +1,10 @@
 """
 app/pipeline/gen_scripts/__init__.py
 --------------------------------------
-gen_scripts: call Groq LLM → parse → validate → return VideoScript.
+gen_scripts: call Gemini LLM → parse → validate → return VideoScript.
 
 Reliability mechanisms:
-  1. Groq JSON mode (response_format=json_object) → no markdown fences.
+  1. Gemini JSON mode (response_mime_type="application/json").
   2. Pydantic schema validation → catches wrong field types, missing params.
   3. Effect keyword validation → rejects hallucinated effect names.
   4. Retry loop (max MAX_RETRIES): on parse/validation failure, the error
@@ -19,7 +19,8 @@ import logging
 import os
 from typing import Optional
 
-from groq import Groq
+from google import genai
+from google.genai import errors, types
 from pydantic import ValidationError
 
 from app.pipeline.manim_framework.effects_catalog import EFFECTS
@@ -29,9 +30,8 @@ from app.pipeline.gen_scripts.prompts import build_system_prompt, build_user_pro
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 _TEMPERATURE = 0.3
-_MAX_TOKENS = 3000
 _MAX_RETRIES = 3
 
 # Built once at module load — the catalog is static.
@@ -95,12 +95,11 @@ def generate_script(prompt: str, progress_cb=None) -> VideoScript:
     ------
     ScriptGenerationError: if all retries are exhausted.
     """
-    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     user_prompt = build_user_prompt(prompt)
 
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+    contents = [
+        types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
     ]
 
     last_error: Optional[str] = None
@@ -113,27 +112,27 @@ def generate_script(prompt: str, progress_cb=None) -> VideoScript:
 
         # ── If a previous attempt failed, append error feedback ─────────────
         if last_error and attempt > 1:
-            messages.append({
-                "role": "assistant",
-                "content": "[previous attempt — invalid output]",
-            })
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Your previous output was invalid. Fix ALL of these errors and "
+            contents.append(
+                types.Content(role="model", parts=[types.Part.from_text(text="[previous attempt — invalid output]")])
+            )
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(
+                    text=f"Your previous output was invalid. Fix ALL of these errors and "
                     f"output ONLY the corrected JSON:\n\n{last_error}"
-                ),
-            })
+                )])
+            )
 
         try:
-            response = client.chat.completions.create(
+            response = client.models.generate_content(
                 model=_MODEL,
-                messages=messages,
-                temperature=_TEMPERATURE,
-                max_tokens=_MAX_TOKENS,
-                response_format={"type": "json_object"},
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    temperature=_TEMPERATURE,
+                    response_mime_type="application/json",
+                )
             )
-            raw = response.choices[0].message.content
+            raw = response.text
 
             # ── Parse JSON ───────────────────────────────────────────────────
             try:
@@ -170,6 +169,13 @@ def generate_script(prompt: str, progress_cb=None) -> VideoScript:
         except Exception as e:
             last_error = f"API error: {type(e).__name__}: {e}"
             logger.error("gen_scripts attempt %d: API error: %s", attempt, e)
+
+            # Invalid requests, credentials, permissions, and unavailable
+            # models cannot succeed by retrying the identical request.
+            if isinstance(e, errors.ClientError) and e.code in {400, 401, 403, 404}:
+                raise ScriptGenerationError(
+                    f"Script generation failed without retrying: {last_error}"
+                ) from e
             continue
 
     raise ScriptGenerationError(

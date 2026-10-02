@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    container_name: cvcc-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount artifacts to host so generated MP4s are accessible easily
+      - ./artifacts:/app/artifacts
+      - ./tmp_manim_scenes:/app/tmp_manim_scenes
+      # Sync source code changes for development (optional)
+      # - ./app:/app/app
+    env_file:
+      - .env
+    environment:
+      - ARTIFACTS_DIR=/app/artifacts
+      - TMP_DIR=/app/tmp_manim_scenes
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
+    # Docker's embedded resolver (127.0.0.11) had no upstream resolver on this
+    # host, causing Gemini requests to fail with ``Temporary failure in name
+    # resolution``.  Set reachable upstream resolvers explicitly for the API.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped

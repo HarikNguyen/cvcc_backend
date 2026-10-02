@@ -1,17 +1,12 @@
 """
 app/pipeline/gen_speech/__init__.py
 ------------------------------------
-gen_speech: Generate per-scene voiceover audio using Google Cloud TTS.
-
-Responsibilities:
-  - Convert each scene's narration text → .mp3 file
-  - Apply voice parameters (speaking_rate, pitch, volume_gain_db)
-  - Measure actual audio duration and attach it back to the scene
-  - Validate output: reject silent / too-short audio files
+--------------------------------------
+gen_speech: Generate voiceovers for each scene using edge-tts.
 
 Reliability mechanisms:
-  1. Audio file size guard: < 1KB → likely empty response → retry
-  2. Audio duration guard: duration < 0.5s → reject as silent
+  1. Minimum file size guard (< 1KB means TTS failed silently)
+  2. Minimum duration guard (< 0.5s means TTS failed silently)
   3. Per-scene retry (max RETRY_PER_SCENE attempts)
   4. If a single scene consistently fails, the job fails fast with a
      clear error naming which scene and why.
@@ -19,9 +14,6 @@ Reliability mechanisms:
 Output layout (per job):
   tmp_manim_scenes/{job_id}/audio/
     scene_01.mp3
-    scene_02.mp3
-    ...
-    scene_01_duration.txt   ← actual measured duration in seconds
     ...
 """
 
@@ -29,10 +21,10 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from google.cloud import texttospeech
 from mutagen.mp3 import MP3
 
 from app.pipeline.script_schema import Scene, VideoScript
@@ -77,27 +69,6 @@ class SpeechGenerationError(Exception):
 
 # ── Core helpers ───────────────────────────────────────────────────────────────
 
-def _build_synthesis_input(scene: Scene) -> texttospeech.SynthesisInput:
-    return texttospeech.SynthesisInput(text=scene.narration)
-
-
-def _build_voice_params(scene: Scene) -> texttospeech.VoiceSelectionParams:
-    return texttospeech.VoiceSelectionParams(
-        language_code=scene.voice_config.language_code,
-        name=scene.voice_config.voice_name,
-    )
-
-
-def _build_audio_config(scene: Scene) -> texttospeech.AudioConfig:
-    return texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=scene.voice_config.speaking_rate,
-        pitch=scene.voice_config.pitch,
-        volume_gain_db=scene.voice_config.volume_gain_db,
-        effects_profile_id=["headphone-class-device"],  # richer audio
-    )
-
-
 def _measure_duration(mp3_path: str) -> float:
     """Return the duration of an mp3 file in seconds using mutagen."""
     audio = MP3(mp3_path)
@@ -105,33 +76,53 @@ def _measure_duration(mp3_path: str) -> float:
 
 
 def _synthesize_scene(
-    client: texttospeech.TextToSpeechClient,
     scene: Scene,
     out_path: str,
 ) -> float:
     """
-    Call Google Cloud TTS for one scene, write mp3 to out_path.
+    Call edge-tts for one scene, write mp3 to out_path.
     Returns measured duration in seconds.
     Raises ValueError if output is empty or too short.
     """
-    response = client.synthesize_speech(
-        input=_build_synthesis_input(scene),
-        voice=_build_voice_params(scene),
-        audio_config=_build_audio_config(scene),
-    )
+    # Use a default voice if the requested one isn't an edge-tts voice
+    voice = scene.voice_config.voice_name
+    if not voice.endswith("Neural"):
+        voice = "en-US-AriaNeural"
+
+    # Rate format for edge-tts (e.g., +10%, -20%)
+    rate_str = f"{int((scene.voice_config.speaking_rate - 1.0) * 100):+d}%"
+    
+    # GCP pitch is in semitones (0.0 is default)
+    # We map 1 semitone to ~5Hz roughly, just to have some effect
+    pitch_str = f"{int(scene.voice_config.pitch * 5):+d}Hz"
+    
+    cmd = [
+        "edge-tts",
+        "--voice", voice,
+        f"--rate={rate_str}",
+        f"--pitch={pitch_str}",
+        "--text", scene.narration,
+        "--write-media", out_path,
+    ]
+    
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"edge-tts failed: {result.stderr}")
+
+    if not os.path.exists(out_path):
+        raise ValueError(f"Scene {scene.scene_id}: edge-tts output file not created.")
 
     # ── Size guard ─────────────────────────────────────────────────────────
-    if len(response.audio_content) < MIN_FILE_SIZE_BYTES:
+    file_size = os.path.getsize(out_path)
+    if file_size < MIN_FILE_SIZE_BYTES:
         raise ValueError(
-            f"Scene {scene.scene_id}: TTS returned {len(response.audio_content)} bytes "
+            f"Scene {scene.scene_id}: TTS returned {file_size} bytes "
             f"(minimum {MIN_FILE_SIZE_BYTES}). Likely empty response."
         )
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(response.audio_content)
-
-    # ── Duration guard ─────────────────────────────────────────────────────
+    # ── Duration guard ────────────────────────────────────────────────     
     duration = _measure_duration(out_path)
     if duration < MIN_DURATION_S:
         os.unlink(out_path)
@@ -173,7 +164,6 @@ def generate_speech(
     audio_dir = os.path.join(base, job_id, "audio")
     Path(audio_dir).mkdir(parents=True, exist_ok=True)
 
-    client = texttospeech.TextToSpeechClient()
     results: list[SceneAudio] = []
 
     for scene in script.scenes:
@@ -193,7 +183,7 @@ def generate_speech(
             )
 
             try:
-                duration = _synthesize_scene(client, scene, mp3_path)
+                duration = _synthesize_scene(scene, mp3_path)
                 logger.info(
                     "gen_speech scene %d OK: %.2fs (script target %.2fs)",
                     scene.scene_id, duration, scene.duration_s,
